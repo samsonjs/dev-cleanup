@@ -1,0 +1,23 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Tests
+    runs-on: docker
+    container:
+      image: docker.io/library/ruby:4.0
+    timeout-minutes: 5
+    steps:
+      - name: Check out
+        uses: https://git.samhuri.net/sjs/actions/checkout@v1
+      - name: Run tests
+        run: ruby -w test/dev_cleanup_test.rb
