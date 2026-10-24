@@ -16,12 +16,14 @@
 # in its arguments or has as its working directory is skipped, so an active
 # build keeps its DerivedData. Simulators go when they're shut down, haven't
 # been used in 14 days and have a custom name; ones named after their device
-# type ("iPhone 17 Pro") stay.
+# type ("iPhone 17 Pro") stay, as do any the config's keep list matches.
 #
 # The defaults cover Xcode's and FlowDeck's DerivedData and FlowDeck's logs.
 # Add your own folders, or change the defaults, in ~/.config/dev-cleanup.yml:
 #
 #   simulator_days: 14
+#   keep_simulators:       # names or UDIDs to spare, globs allowed
+#     - ci-golden-*
 #   directories:
 #     - path: ~/.claude-scratchpad
 #       days: 7                # remove top-level entries untouched this long
@@ -62,7 +64,11 @@ module DevCleanup
   Candidate = Data.define(:path, :days)
   Simulator = Data.define(:udid, :name, :bytes, :last_used_at)
 
-  Config = Data.define(:targets, :simulator_days) do
+  Config = Data.define(:targets, :simulator_days, :keep_simulators) do
+    def initialize(targets:, simulator_days:, keep_simulators: [])
+      super
+    end
+
     def self.load(path, home: Dir.home)
       settings = File.exist?(path) ? YAML.safe_load_file(path) || {} : {}
       targets = {}
@@ -73,6 +79,7 @@ module DevCleanup
       new(
         targets: targets.values,
         simulator_days: positive_days(settings.fetch("simulator_days", DEFAULT_SIMULATOR_DAYS)),
+        keep_simulators: Array(settings["keep_simulators"]).map { it.to_s },
       )
     end
 
@@ -171,12 +178,19 @@ module DevCleanup
     args + cwds.filter_map { it[1..] if it.start_with?("n") }
   end
 
-  def stale_simulators(devices:, device_types:, days:, now:)
+  def kept_simulator?(device, keep)
+    keep.any? do |pattern|
+      File.fnmatch?(pattern, device["name"], File::FNM_CASEFOLD) ||
+        File.fnmatch?(pattern, device["udid"], File::FNM_CASEFOLD)
+    end
+  end
+
+  def stale_simulators(devices:, device_types:, days:, now:, keep: [])
     stock_names = device_types.fetch("devicetypes").map { it["name"] }
     cutoff = now - (days * DAY)
     devices.fetch("devices").values.flatten.filter_map do |device|
       next unless device["isAvailable"] && device["state"] == "Shutdown" && device["lastUsedAt"]
-      next if stock_names.include?(device["name"])
+      next if stock_names.include?(device["name"]) || kept_simulator?(device, keep)
 
       last_used_at = Time.iso8601(device["lastUsedAt"])
       next if last_used_at > cutoff
@@ -246,7 +260,10 @@ module DevCleanup
       system("xcrun", "simctl", "delete", "unavailable") if delete
       devices = simctl_json("devices")
       device_types = simctl_json("devicetypes")
-      stale = DevCleanup.stale_simulators(devices:, device_types:, days: config.simulator_days, now:)
+      stale = DevCleanup.stale_simulators(
+        devices:, device_types:, days: config.simulator_days,
+        keep: config.keep_simulators, now:,
+      )
       stale.sum do |sim|
         last_used = sim.last_used_at.localtime.strftime("%Y-%m-%d")
         out.puts "  #{DevCleanup.format_bytes(sim.bytes).rjust(9)}  simulator #{sim.name} " \

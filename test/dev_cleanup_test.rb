@@ -168,6 +168,55 @@ class DevCleanupTest < Minitest::Test
     assert_equal 6_000_000_000, stale.first.bytes
   end
 
+  def test_simulators_on_the_keep_list_are_never_stale
+    devices = {
+      "devices" => {
+        "com.apple.CoreSimulator.SimRuntime.iOS-27-0" => [
+          simulator(name: "ci-golden-iPhone-17-Pro-27.0-24A434"),
+          simulator(name: "ci-golden-iPhone-16-Pro-18.6-22G86"),
+          simulator(name: "Bad Religion"),
+          simulator(name: "NOFX"),
+        ],
+      },
+    }
+    device_types = {"devicetypes" => [{"name" => "iPhone 17 Pro"}]}
+
+    stale = DevCleanup.stale_simulators(
+      devices:, device_types:, days: 14, now: NOW, keep: ["ci-golden-*", "udid-nofx"],
+    )
+
+    assert_equal ["Bad Religion"], stale.map(&:name)
+  end
+
+  def test_the_keep_list_is_empty_by_default
+    devices = {
+      "devices" => {
+        "com.apple.CoreSimulator.SimRuntime.iOS-27-0" => [simulator(name: "ci-golden-leftover")],
+      },
+    }
+
+    stale = DevCleanup.stale_simulators(
+      devices:, device_types: {"devicetypes" => []}, days: 14, now: NOW,
+    )
+
+    assert_equal ["ci-golden-leftover"], stale.map(&:name)
+  end
+
+  def test_config_reads_the_keep_list
+    with_root do |root|
+      path = File.join(root, "dev-cleanup.yml")
+      File.write(path, <<~YAML)
+        keep_simulators:
+          - ci-golden-*
+          - 0EAE92DA-184D-4B49-9D4F-812E0EF6FB16
+      YAML
+
+      config = DevCleanup::Config.load(path, home: "/Users/greg")
+
+      assert_equal ["ci-golden-*", "0EAE92DA-184D-4B49-9D4F-812E0EF6FB16"], config.keep_simulators
+    end
+  end
+
   def test_config_adds_directories_and_overrides_defaults_by_path
     with_root do |root|
       path = File.join(root, "dev-cleanup.yml")
@@ -197,6 +246,7 @@ class DevCleanupTest < Minitest::Test
     config = DevCleanup::Config.load("/nonexistent/dev-cleanup.yml", home: "/Users/greg")
 
     assert_equal DevCleanup::DEFAULT_SIMULATOR_DAYS, config.simulator_days
+    assert_empty config.keep_simulators
     assert_includes config.targets.map(&:path), "/Users/greg/Library/Developer/Xcode/DerivedData"
   end
 

@@ -22,7 +22,8 @@ Start with a dry run to see what it would delete.
   top level looks old.
 - **Simulators** that are shut down, haven't been used in 14 days and have a
   custom name. Simulators named after their device type ("iPhone 17 Pro")
-  stay. Unavailable ones go too, via `simctl delete unavailable`.
+  stay, as do any the `keep_simulators` list matches. Unavailable ones go too,
+  via `simctl delete unavailable`.
 - **Anything a running process is using is skipped.** That's anything a
   process mentions in its arguments or has as its working directory.
 
@@ -34,6 +35,9 @@ Add folders, or change the defaults, in `~/.config/dev-cleanup.yml`:
 
 ```yaml
 simulator_days: 14
+keep_simulators:
+  - ci-golden-*          # globs allowed
+  - 0EAE92DA-184D-4B49-9D4F-812E0EF6FB16
 directories:
   - path: ~/.claude-scratchpad
     days: 7                # remove top-level entries untouched this long
@@ -42,7 +46,8 @@ directories:
     days: 5
 ```
 
-An entry with the same path as a default replaces it.
+An entry with the same path as a default replaces it. `keep_simulators` entries
+are matched against both the name and the UDID, ignoring case.
 
 ## The launchd agent
 
