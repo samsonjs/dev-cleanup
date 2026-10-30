@@ -113,6 +113,49 @@ class DevCleanupTest < Minitest::Test
     end
   end
 
+  def test_swiftpm_build_folders_count_but_nothing_else_goes_without_days
+    with_root do |root|
+      package = File.join(root, "OneSE", "OSERewind")
+      build = File.join(package, ".build")
+      write(File.join(package, "Package.swift"), "// swift-tools-version: 6.2")
+      write(File.join(build, "index-build", "build.db"), "x")
+      write(File.join(root, "dotfiles", ".build", "not-swiftpm"), "x")
+      age(root, days: 30)
+
+      t = target(root, days: nil, derived_data_days: 3)
+
+      candidates = DevCleanup.candidates_for(t, now: NOW)
+
+      assert_equal [build], candidate_paths(candidates)
+    end
+  end
+
+  def test_config_allows_a_directory_searched_only_for_build_folders
+    with_root do |root|
+      path = File.join(root, "dev-cleanup.yml")
+      File.write(path, <<~YAML)
+        directories:
+          - path: ~/Developer
+            derived_data_days: 3
+      YAML
+
+      config = DevCleanup::Config.load(path, home: "/Users/greg")
+      developer = config.targets.find { it.path == "/Users/greg/Developer" }
+
+      assert_nil developer.days
+      assert_equal 3, developer.derived_data_days
+    end
+  end
+
+  def test_config_rejects_a_directory_with_neither_kind_of_days
+    with_root do |root|
+      path = File.join(root, "dev-cleanup.yml")
+      File.write(path, "directories:\n  - path: ~/Developer\n")
+
+      assert_raises(ArgumentError) { DevCleanup::Config.load(path, home: "/Users/greg") }
+    end
+  end
+
   def test_derived_data_inside_a_child_that_is_already_going_is_not_listed_twice
     with_root do |root|
       folder = File.join(root, "one-1149")
@@ -250,12 +293,184 @@ class DevCleanupTest < Minitest::Test
     assert_includes config.targets.map(&:path), "/Users/greg/Library/Developer/Xcode/DerivedData"
   end
 
-  def run_cleanup(root, delete:, busy: [])
+  def test_config_reads_the_free_space_settings
+    with_root do |root|
+      path = File.join(root, "dev-cleanup.yml")
+      File.write(path, <<~YAML)
+        min_free_gb: 0
+        evict_after_hours: 12
+      YAML
+
+      config = DevCleanup::Config.load(path, home: "/Users/greg")
+
+      assert_equal 0, config.min_free_gb
+      assert_equal 12, config.evict_after_hours
+    end
+  end
+
+  def test_the_free_space_defaults
+    config = DevCleanup::Config.load("/nonexistent/dev-cleanup.yml", home: "/Users/greg")
+
+    assert_equal DevCleanup::DEFAULT_MIN_FREE_GB, config.min_free_gb
+    assert_equal DevCleanup::DEFAULT_EVICT_AFTER_HOURS, config.evict_after_hours
+  end
+
+  def test_the_defaults_cover_gradle_and_homebrew_caches
+    config = DevCleanup::Config.load("/nonexistent/dev-cleanup.yml", home: "/Users/greg")
+    paths = config.targets.map(&:path)
+
+    assert_includes paths, "/Users/greg/.gradle/caches"
+    assert_includes paths, "/Users/greg/.gradle/wrapper/dists"
+    assert_includes paths, "/Users/greg/Library/Caches/Homebrew/downloads"
+  end
+
+  def test_only_the_newest_device_support_per_device_model_is_kept
+    with_root do |root|
+      names = [
+        "iPhone14,4 26.7.1 (23H30)", "iPhone14,4 27.0.1 (24A446)", "iPhone14,4 26.10 (23J5)",
+        "iPhone18,1 27.0.1 (24A446)", "Watch7,1 11.2 (22S5)", "Watch7,1 12.0 (23R3)", "notes",
+      ]
+      names.each { FileUtils.mkdir_p(File.join(root, it)) }
+
+      stale = DevCleanup.stale_device_support(root)
+
+      assert_equal(
+        ["Watch7,1 11.2 (22S5)", "iPhone14,4 26.10 (23J5)", "iPhone14,4 26.7.1 (23H30)"],
+        stale.map { File.basename(it) }.sort,
+      )
+    end
+  end
+
+  def run_cleanup(root, delete:, busy: [], free_bytes: 1024**4, device_support_roots: [])
     out = StringIO.new
-    config = DevCleanup::Config.new(targets: [target(root)], simulator_days: 14)
-    cleaner = DevCleanup::Cleaner.new(config:, delete:, busy:, simulators: false, out:, now: NOW)
+    config = DevCleanup::Config.new(
+      targets: [target(root)], simulator_days: 14, min_free_gb: 1, evict_after_hours: 6,
+    )
+    cleaner = DevCleanup::Cleaner.new(
+      config:, delete:, busy:, free_bytes:, device_support_roots:, simulators: false, out:,
+      now: NOW,
+    )
     cleaner.run
     out.string
+  end
+
+  MB = 1024**2
+  GB = 1024**3
+
+  def make_build(path, days:)
+    make_derived_data(path)
+    write(File.join(path, "Build", "Intermediates.noindex", "blob"), "x" * MB)
+    age(path, days:)
+  end
+
+  def test_when_free_space_is_short_the_least_recently_built_derived_data_goes_first
+    with_root do |root|
+      fugazi = File.join(root, "OneSE-fugazi")
+      slint = File.join(root, "OneSE-slint")
+      pinback = File.join(root, "OneSE-pinback")
+      make_build(fugazi, days: 2)
+      make_build(slint, days: 1.5)
+      make_build(pinback, days: 1)
+
+      output = run_cleanup(root, delete: true, free_bytes: GB - (MB * 3 / 2))
+
+      refute File.exist?(fugazi)
+      refute File.exist?(slint)
+      assert File.exist?(pinback)
+      assert_includes output, "short of 1 GB free"
+    end
+  end
+
+  def test_nothing_is_evicted_while_free_space_is_above_the_target
+    with_root do |root|
+      build = File.join(root, "OneSE-fugazi")
+      make_build(build, days: 2)
+
+      output = run_cleanup(root, delete: true, free_bytes: 2 * GB)
+
+      assert File.exist?(build)
+      refute_includes output, "short of"
+    end
+  end
+
+  def test_recent_builds_builds_in_use_and_shared_caches_are_never_evicted
+    with_root do |root|
+      recent = File.join(root, "OneSE-recent")
+      busy = File.join(root, "OneSE-busy")
+      cache = File.join(root, "CompilationCache.noindex")
+      make_build(busy, days: 2)
+      write(File.join(cache, "blob"), "x" * MB)
+      age(cache, days: 2)
+      make_build(recent, days: 0.1)
+
+      run_cleanup(
+        root, delete: true, free_bytes: 0, busy: ["xcodebuild -derivedDataPath #{busy}"],
+      )
+
+      assert File.exist?(recent)
+      assert File.exist?(busy)
+      assert File.exist?(cache)
+    end
+  end
+
+  def test_derived_data_nested_in_a_scratch_folder_can_be_evicted
+    with_root do |root|
+      folder = File.join(root, "OneSE-one-982")
+      build = File.join(folder, "dd")
+      notes = File.join(folder, "notes.md")
+      make_build(build, days: 2)
+      write(notes, "Big Lebowski")
+
+      run_cleanup(root, delete: true, free_bytes: 0)
+
+      refute File.exist?(build)
+      assert File.exist?(notes)
+    end
+  end
+
+  def test_a_dry_run_counts_what_aging_out_would_free_before_evicting
+    with_root do |root|
+      stale = File.join(root, "OneSE-stale")
+      young = File.join(root, "OneSE-young")
+      make_build(stale, days: 5)
+      make_build(young, days: 2)
+
+      output = run_cleanup(root, delete: false, free_bytes: GB - (MB / 2))
+
+      assert File.exist?(stale)
+      assert File.exist?(young)
+      assert_includes output, stale
+      refute_includes output, young
+    end
+  end
+
+  def test_a_dry_run_lists_evictions_without_deleting
+    with_root do |root|
+      build = File.join(root, "OneSE-fugazi")
+      make_build(build, days: 2)
+
+      output = run_cleanup(root, delete: false, free_bytes: 0)
+
+      assert File.exist?(build)
+      assert_includes output, build
+      assert_includes output, "Would free"
+    end
+  end
+
+  def test_device_support_for_older_versions_is_removed
+    with_root do |root|
+      support = File.join(root, "iOS DeviceSupport")
+      old = File.join(support, "iPhone14,4 26.7.1 (23H30)")
+      current = File.join(support, "iPhone14,4 27.0.1 (24A446)")
+      write(File.join(old, "Symbols", "dyld"), "x")
+      write(File.join(current, "Symbols", "dyld"), "x")
+
+      output = run_cleanup(root, delete: true, device_support_roots: [support])
+
+      refute File.exist?(old)
+      assert File.exist?(current)
+      assert_includes output, old
+    end
   end
 
   def test_a_dry_run_lists_without_deleting

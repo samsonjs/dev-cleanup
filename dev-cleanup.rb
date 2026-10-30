@@ -3,8 +3,11 @@
 
 #
 # Frees disk space that Xcode, FlowDeck and agent scratch folders pile up and
-# never give back: DerivedData nobody has built into lately, old FlowDeck logs,
-# and simulators that were made for one task and never booted again.
+# never give back: DerivedData and SwiftPM .build folders nobody has built into
+# lately, old FlowDeck logs, Gradle and Homebrew caches, outdated device support
+# files, and simulators that were made for one task and never booted again.
+# When less than min_free_gb is free after that, it removes the least recently
+# built DerivedData, sparing anything built in the last evict_after_hours.
 #
 #   ./dev-cleanup.rb             # dry run: list what would go and how big it is
 #   ./dev-cleanup.rb --delete    # actually delete it
@@ -18,16 +21,21 @@
 # been used in 14 days and have a custom name; ones named after their device
 # type ("iPhone 17 Pro") stay, as do any the config's keep list matches.
 #
-# The defaults cover Xcode's and FlowDeck's DerivedData and FlowDeck's logs.
-# Add your own folders, or change the defaults, in ~/.config/dev-cleanup.yml:
+# The defaults cover Xcode's and FlowDeck's DerivedData, FlowDeck's logs, and
+# the Gradle and Homebrew caches. Add your own folders, or change the defaults,
+# in ~/.config/dev-cleanup.yml:
 #
 #   simulator_days: 14
+#   min_free_gb: 150       # 0 turns off removing builds for space
+#   evict_after_hours: 6
 #   keep_simulators:       # names or UDIDs to spare, globs allowed
 #     - ci-golden-*
 #   directories:
 #     - path: ~/.claude-scratchpad
 #       days: 7                # remove top-level entries untouched this long
-#       derived_data_days: 3   # and DerivedData folders found inside, sooner
+#       derived_data_days: 3   # and build folders found inside, sooner
+#     - path: ~/Developer
+#       derived_data_days: 3   # build folders only, nothing else goes
 #     - path: ~/Library/Developer/Xcode/DerivedData
 #       days: 5
 #
@@ -47,11 +55,18 @@ require "yaml"
 module DevCleanup
   DAY = 86_400
   MAX_DEPTH = 4
+  HOUR = 3_600
+  GB = 1024**3
   DEFAULT_SIMULATOR_DAYS = 14
+  DEFAULT_MIN_FREE_GB = 150
+  DEFAULT_EVICT_AFTER_HOURS = 6
   DEFAULT_DIRECTORIES = [
     {"path" => "~/Library/Developer/Xcode/DerivedData", "days" => 3},
     {"path" => "~/Library/Developer/FlowDeck/DerivedData", "days" => 3},
     {"path" => "~/.flowdeck/logs", "days" => 3},
+    {"path" => "~/.gradle/caches", "days" => 14},
+    {"path" => "~/.gradle/wrapper/dists", "days" => 14},
+    {"path" => "~/Library/Caches/Homebrew/downloads", "days" => 14},
   ].freeze
   CONFIG_PATH = File.join(Dir.home, ".config", "dev-cleanup.yml")
 
@@ -62,10 +77,16 @@ module DevCleanup
 
   Target = Data.define(:path, :days, :derived_data_days)
   Candidate = Data.define(:path, :days)
+  Build = Data.define(:path, :touched_at)
   Simulator = Data.define(:udid, :name, :bytes, :last_used_at)
 
-  Config = Data.define(:targets, :simulator_days, :keep_simulators) do
-    def initialize(targets:, simulator_days:, keep_simulators: [])
+  Config = Data.define(
+    :targets, :simulator_days, :keep_simulators, :min_free_gb, :evict_after_hours,
+  ) do
+    def initialize(
+      targets:, simulator_days:, keep_simulators: [], min_free_gb: DEFAULT_MIN_FREE_GB,
+      evict_after_hours: DEFAULT_EVICT_AFTER_HOURS
+    )
       super
     end
 
@@ -80,22 +101,33 @@ module DevCleanup
         targets: targets.values,
         simulator_days: positive_days(settings.fetch("simulator_days", DEFAULT_SIMULATOR_DAYS)),
         keep_simulators: Array(settings["keep_simulators"]).map { it.to_s },
+        min_free_gb: at_least(0, settings.fetch("min_free_gb", DEFAULT_MIN_FREE_GB), "min_free_gb"),
+        evict_after_hours: at_least(
+          1, settings.fetch("evict_after_hours", DEFAULT_EVICT_AFTER_HOURS), "evict_after_hours",
+        ),
       )
     end
 
     def self.target_from(entry, home:)
+      path = entry.fetch("path")
+      unless entry["days"] || entry["derived_data_days"]
+        raise ArgumentError, "#{path} needs days, derived_data_days or both"
+      end
+
       Target.new(
-        path: entry.fetch("path").sub(%r{\A~(?=/|\z)}, home),
-        days: positive_days(entry.fetch("days")),
+        path: path.sub(%r{\A~(?=/|\z)}, home),
+        days: entry["days"]&.then { positive_days(it) },
         derived_data_days: entry["derived_data_days"]&.then { positive_days(it) },
       )
     end
 
-    def self.positive_days(value)
-      days = Integer(value)
-      raise ArgumentError, "days must be at least 1, got #{value}" if days < 1
+    def self.positive_days(value) = at_least(1, value, "days")
 
-      days
+    def self.at_least(min, value, name)
+      number = Integer(value)
+      raise ArgumentError, "#{name} must be at least #{min}, got #{value}" if number < min
+
+      number
     end
   end
 
@@ -118,8 +150,14 @@ module DevCleanup
       File.directory?(File.join(path, "Build", "Intermediates.noindex"))
   end
 
+  def swiftpm_build?(path)
+    File.basename(path) == ".build" && File.file?(File.join(File.dirname(path), "Package.swift"))
+  end
+
+  def build_folder?(path) = derived_data?(path) || swiftpm_build?(path)
+
   def stale_children(target, now:)
-    return [] unless File.directory?(target.path)
+    return [] unless target.days && File.directory?(target.path)
 
     cutoff = now - (target.days * DAY)
     Dir.children(target.path).sort.filter_map do |name|
@@ -146,7 +184,7 @@ module DevCleanup
       path = File.join(dir, name)
       next [] if File.symlink?(path) || !File.directory?(path)
 
-      derived_data?(path) ? [path] : derived_data_within(path, depth: depth + 1)
+      build_folder?(path) ? [path] : derived_data_within(path, depth: depth + 1)
     end
   rescue SystemCallError
     []
@@ -158,6 +196,50 @@ module DevCleanup
       children.any? { candidate.path.start_with?("#{it.path}/") }
     end
     children + nested
+  end
+
+  def last_touched_at(path, now:, depth: 0)
+    stat = File.lstat(path)
+    return stat.mtime unless stat.directory? && depth < MAX_DEPTH
+
+    times = Dir.each_child(path).map do
+      last_touched_at(File.join(path, it), now:, depth: depth + 1)
+    end
+    times.compact.push(stat.mtime).max
+  rescue Errno::ENOENT
+    nil
+  rescue SystemCallError
+    now
+  end
+
+  def evictable_builds(targets, now:, evict_after_hours:)
+    cutoff = now - (evict_after_hours * HOUR)
+    paths = targets.flat_map { derived_data_within(it.path, depth: 1) }.uniq
+    builds = paths.filter_map do |path|
+      touched_at = last_touched_at(path, now:)
+      Build.new(path:, touched_at:) if touched_at && touched_at <= cutoff
+    end
+    builds.sort_by(&:touched_at)
+  end
+
+  def free_bytes(path)
+    capture("df", "-kP", path).lines[1].split[3].to_i * 1024
+  end
+
+  def device_support_roots
+    Dir.glob(File.join(Dir.home, "Library", "Developer", "Xcode", "* DeviceSupport"))
+  end
+
+  def stale_device_support(root)
+    versioned = Dir.children(root).filter_map do |name|
+      match = name.match(/\A(?<model>\S+) (?<version>\d+(?:\.\d+)*) \(/)
+      [File.join(root, name), match[:model], Gem::Version.new(match[:version])] if match
+    end
+    versioned.group_by { it[1] }.values.flat_map do |entries|
+      entries.sort_by { it[2] }[...-1].map(&:first)
+    end
+  rescue SystemCallError
+    []
   end
 
   def in_use?(path, busy)
@@ -216,19 +298,28 @@ module DevCleanup
   class Cleaner
     attr_reader :config, :delete, :simulators, :out, :now
 
-    def initialize(config:, delete:, busy: nil, simulators: true, out: $stdout, now: Time.now)
+    def initialize(
+      config:, delete:, busy: nil, free_bytes: nil, device_support_roots: nil, simulators: true,
+      out: $stdout, now: Time.now
+    )
       @config = config
       @delete = delete
       @busy = busy
+      @free_bytes = free_bytes
+      @device_support_roots = device_support_roots
       @simulators = simulators
       @out = out
       @now = now
+      @handled = []
     end
 
     def run
       out.puts "#{delete ? "Cleaning up" : "Dry run"} at #{now.iso8601}"
+      free_at_start = free_bytes
       total = config.targets.sum { clean_target(it) }
+      total += device_support_roots.sum { clean_device_support(it) }
       total += clean_simulators if simulators
+      total += evict((config.min_free_gb * GB) - free_at_start - total)
       out.puts "#{delete ? "Freed" : "Would free"} #{DevCleanup.format_bytes(total)}"
       total
     end
@@ -237,23 +328,57 @@ module DevCleanup
 
     def busy = @busy ||= DevCleanup.busy_paths
 
+    def free_bytes = @free_bytes ||= DevCleanup.free_bytes(Dir.home)
+
+    def device_support_roots = @device_support_roots ||= DevCleanup.device_support_roots
+
     def clean_target(target)
-      DevCleanup.candidates_for(target, now:).sum do |candidate|
-        if DevCleanup.in_use?(candidate.path, busy)
-          out.puts "  skipped (in use)  #{candidate.path}"
-          next 0
-        end
+      DevCleanup.candidates_for(target, now:).sum { remove(it.path) }
+    end
 
-        bytes = DevCleanup.disk_bytes(candidate.path)
-        out.puts "  #{DevCleanup.format_bytes(bytes).rjust(9)}  #{candidate.path}"
-        next bytes unless delete
+    def clean_device_support(root)
+      DevCleanup.stale_device_support(root).sum { remove(it) }
+    end
 
-        system("/bin/rm", "-rf", candidate.path)
-        next bytes unless File.exist?(candidate.path)
+    def evict(shortfall)
+      return 0 unless shortfall.positive?
 
-        out.puts "  couldn't remove all of #{candidate.path}"
-        bytes - DevCleanup.disk_bytes(candidate.path)
+      out.puts "  #{DevCleanup.format_bytes(shortfall)} short of #{config.min_free_gb} GB free, " \
+        "removing the least recently built DerivedData"
+      builds = DevCleanup.evictable_builds(
+        config.targets, now:, evict_after_hours: config.evict_after_hours,
+      )
+      freed = 0
+      builds.each do |build|
+        break if freed >= shortfall
+        next if handled?(build.path)
+
+        built = build.touched_at.localtime.strftime("%Y-%m-%d %H:%M")
+        freed += remove(build.path, note: "built #{built}")
       end
+      freed
+    end
+
+    def handled?(path)
+      @handled.any? { path == it || path.start_with?("#{it}/") }
+    end
+
+    def remove(path, note: nil)
+      @handled << path
+      if DevCleanup.in_use?(path, busy)
+        out.puts "  skipped (in use)  #{path}"
+        return 0
+      end
+
+      bytes = DevCleanup.disk_bytes(path)
+      out.puts "  #{DevCleanup.format_bytes(bytes).rjust(9)}  #{path}#{" (#{note})" if note}"
+      return bytes unless delete
+
+      system("/bin/rm", "-rf", path)
+      return bytes unless File.exist?(path)
+
+      out.puts "  couldn't remove all of #{path}"
+      bytes - DevCleanup.disk_bytes(path)
     end
 
     def clean_simulators
