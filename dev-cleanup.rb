@@ -299,13 +299,14 @@ module DevCleanup
     attr_reader :config, :delete, :simulators, :out, :now
 
     def initialize(
-      config:, delete:, busy: nil, free_bytes: nil, device_support_roots: nil, simulators: true,
-      out: $stdout, now: Time.now
+      config:, delete:, busy: nil, free_bytes: nil, disk_bytes: nil, device_support_roots: nil,
+      simulators: true, out: $stdout, now: Time.now
     )
       @config = config
       @delete = delete
       @busy = busy
       @free_bytes = free_bytes
+      @disk_bytes = disk_bytes || DevCleanup.method(:disk_bytes)
       @device_support_roots = device_support_roots
       @simulators = simulators
       @out = out
@@ -329,6 +330,8 @@ module DevCleanup
     def busy = @busy ||= DevCleanup.busy_paths
 
     def free_bytes = @free_bytes ||= DevCleanup.free_bytes(Dir.home)
+
+    def disk_bytes(path) = @disk_bytes.call(path)
 
     def device_support_roots = @device_support_roots ||= DevCleanup.device_support_roots
 
@@ -370,7 +373,7 @@ module DevCleanup
         return 0
       end
 
-      bytes = DevCleanup.disk_bytes(path)
+      bytes = disk_bytes(path)
       out.puts "  #{DevCleanup.format_bytes(bytes).rjust(9)}  #{path}#{" (#{note})" if note}"
       return bytes unless delete
 
@@ -378,7 +381,7 @@ module DevCleanup
       return bytes unless File.exist?(path)
 
       out.puts "  couldn't remove all of #{path}"
-      bytes - DevCleanup.disk_bytes(path)
+      bytes - disk_bytes(path)
     end
 
     def clean_simulators

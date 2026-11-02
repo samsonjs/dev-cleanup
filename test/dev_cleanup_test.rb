@@ -347,11 +347,20 @@ class DevCleanupTest < Minitest::Test
       targets: [target(root)], simulator_days: 14, min_free_gb: 1, evict_after_hours: 6,
     )
     cleaner = DevCleanup::Cleaner.new(
-      config:, delete:, busy:, free_bytes:, device_support_roots:, simulators: false, out:,
-      now: NOW,
+      config:, delete:, busy:, free_bytes:, disk_bytes: method(:file_bytes), device_support_roots:,
+      simulators: false, out:, now: NOW,
     )
     cleaner.run
     out.string
+  end
+
+  def file_bytes(path)
+    return File.size(path) if File.file?(path)
+
+    Dir.glob("**/*", File::FNM_DOTMATCH, base: path).sum do
+      file = File.join(path, it)
+      File.file?(file) ? File.size(file) : 0
+    end
   end
 
   MB = 1024**2
@@ -359,7 +368,7 @@ class DevCleanupTest < Minitest::Test
 
   def make_build(path, days:)
     make_derived_data(path)
-    write(File.join(path, "Build", "Intermediates.noindex", "blob"), Random.bytes(MB))
+    write(File.join(path, "Build", "Intermediates.noindex", "blob"), "x" * MB)
     age(path, days:)
   end
 
@@ -399,7 +408,7 @@ class DevCleanupTest < Minitest::Test
       busy = File.join(root, "OneSE-busy")
       cache = File.join(root, "CompilationCache.noindex")
       make_build(busy, days: 2)
-      write(File.join(cache, "blob"), Random.bytes(MB))
+      write(File.join(cache, "blob"), "x" * MB)
       age(cache, days: 2)
       make_build(recent, days: 0.1)
 
