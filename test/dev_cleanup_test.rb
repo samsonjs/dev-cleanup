@@ -359,7 +359,7 @@ class DevCleanupTest < Minitest::Test
 
   def make_build(path, days:)
     make_derived_data(path)
-    write(File.join(path, "Build", "Intermediates.noindex", "blob"), "x" * MB)
+    write(File.join(path, "Build", "Intermediates.noindex", "blob"), Random.bytes(MB))
     age(path, days:)
   end
 
@@ -399,7 +399,7 @@ class DevCleanupTest < Minitest::Test
       busy = File.join(root, "OneSE-busy")
       cache = File.join(root, "CompilationCache.noindex")
       make_build(busy, days: 2)
-      write(File.join(cache, "blob"), "x" * MB)
+      write(File.join(cache, "blob"), Random.bytes(MB))
       age(cache, days: 2)
       make_build(recent, days: 0.1)
 
