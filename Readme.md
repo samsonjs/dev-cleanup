@@ -8,7 +8,7 @@ again. It's one Ruby file with no gems, and it needs Ruby 3.4 or later.
 ```zsh
 ./dev-cleanup.rb             # dry run: list what would go and how big it is
 ./dev-cleanup.rb --delete    # actually delete it
-./dev-cleanup.rb --install   # run --delete daily at 04:00 with launchd
+./dev-cleanup.rb --install   # run --delete hourly with launchd
 ./dev-cleanup.rb --uninstall
 ```
 
@@ -54,8 +54,9 @@ are matched against both the name and the UDID, ignoring case.
 `--install` copies the script to `~/Library/Application Support/dev-cleanup`,
 so the agent doesn't depend on your checkout. The agent runs it with the Ruby
 that ran the install. Re-run `--install` after pulling changes, or after
-removing that Ruby. If the Mac is asleep at 04:00, the run happens when it
-wakes. Each run appends what it removed to `~/Library/Logs/dev-cleanup.log`.
+removing that Ruby. It runs on the hour, and if the Mac is asleep then, the run
+happens when it wakes. Each run appends what it removed to
+`~/Library/Logs/dev-cleanup.log`.
 
 ## Tests
 

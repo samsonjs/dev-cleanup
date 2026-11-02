@@ -8,7 +8,7 @@
 #
 #   ./dev-cleanup.rb             # dry run: list what would go and how big it is
 #   ./dev-cleanup.rb --delete    # actually delete it
-#   ./dev-cleanup.rb --install   # run --delete daily at 04:00 with launchd
+#   ./dev-cleanup.rb --install   # run --delete hourly with launchd
 #   ./dev-cleanup.rb --uninstall
 #
 # Something counts as untouched when nothing in it, down to a few levels deep,
@@ -278,25 +278,25 @@ module DevCleanup
     def simctl_json(kind) = JSON.parse(DevCleanup.capture("xcrun", "simctl", "list", kind, "-j"))
   end
 
-  def install(hour:)
+  def install
     FileUtils.mkdir_p(INSTALL_DIR)
     script = File.join(INSTALL_DIR, "dev-cleanup.rb")
     FileUtils.cp(__FILE__, script)
     FileUtils.mkdir_p(File.dirname(PLIST_PATH))
-    File.write(PLIST_PATH, JSON.generate(launchd_job(script:, hour:)))
+    File.write(PLIST_PATH, JSON.generate(launchd_job(script:)))
     system("plutil", "-convert", "xml1", PLIST_PATH, exception: true)
 
     domain = "gui/#{Process.uid}"
     system("launchctl", "bootout", "#{domain}/#{LABEL}", err: File::NULL)
     system("launchctl", "bootstrap", domain, PLIST_PATH, exception: true)
-    puts "Installed #{LABEL}: runs daily at #{format("%02d:00", hour)}, logs to #{LOG_PATH}"
+    puts "Installed #{LABEL}: runs hourly, logs to #{LOG_PATH}"
   end
 
-  def launchd_job(script:, hour:)
+  def launchd_job(script:)
     {
       "Label" => LABEL,
       "ProgramArguments" => [RbConfig.ruby, script, "--delete"],
-      "StartCalendarInterval" => {"Hour" => hour, "Minute" => 0},
+      "StartCalendarInterval" => {"Minute" => 0},
       "StandardOutPath" => LOG_PATH,
       "StandardErrorPath" => LOG_PATH,
       "EnvironmentVariables" => {"PATH" => "/usr/bin:/bin:/usr/sbin:/sbin"},
@@ -314,20 +314,19 @@ module DevCleanup
   end
 
   def main(argv)
-    options = {delete: false, simulators: true, config: CONFIG_PATH, hour: 4}
+    options = {delete: false, simulators: true, config: CONFIG_PATH}
     action = :run
     OptionParser.new do |parser|
       parser.banner = "Usage: #{File.basename($PROGRAM_NAME)} [options]"
       parser.on("--delete", "Delete what a dry run lists") { options[:delete] = true }
       parser.on("--no-simulators", "Leave simulators alone") { options[:simulators] = false }
       parser.on("--config PATH", "Config file (default: #{CONFIG_PATH})") { options[:config] = it }
-      parser.on("--install", "Run --delete daily with launchd") { action = :install }
-      parser.on("--hour HOUR", Integer, "Hour of the daily run (default: 4)") { options[:hour] = it }
+      parser.on("--install", "Run --delete hourly with launchd") { action = :install }
       parser.on("--uninstall", "Remove the launchd agent") { action = :uninstall }
     end.parse!(argv)
 
     case action
-    when :install then install(hour: options[:hour])
+    when :install then install
     when :uninstall then uninstall
     else
       config = Config.load(options[:config])

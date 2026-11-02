@@ -289,4 +289,11 @@ class DevCleanupTest < Minitest::Test
       assert_includes output, "Freed"
     end
   end
+
+  def test_the_launchd_job_runs_every_hour_on_the_hour
+    job = DevCleanup.launchd_job(script: "/tmp/dev-cleanup.rb")
+
+    assert_equal({"Minute" => 0}, job["StartCalendarInterval"])
+    assert_equal [RbConfig.ruby, "/tmp/dev-cleanup.rb", "--delete"], job["ProgramArguments"]
+  end
 end
